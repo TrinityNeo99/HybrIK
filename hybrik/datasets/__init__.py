@@ -5,8 +5,9 @@ from .pw3d import PW3D
 from .agora_smplx import AGORAX
 from .mix_dataset_cam import MixDatasetCam
 from .mix_dataset2_cam import MixDataset2Cam
+from .binocular_coco import Binocuular_coco
 
 __all__ = [
     'H36mSMPL', 'HP3D', 'PW3D',
     'MixDataset', 'MixDatasetCam', 'MixDataset2Cam',
-    'AGORAX']
+    'AGORAX', 'Binocuular_coco']

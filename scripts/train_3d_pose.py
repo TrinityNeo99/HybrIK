@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 import torch.utils.data
 from torch.nn.utils import clip_grad
 sys.path.append("./")
-from hybrik.datasets import MixDataset, MixDatasetCam, PW3D, MixDataset2Cam
+from hybrik.datasets import MixDataset, MixDatasetCam, PW3D, MixDataset2Cam, Binocuular_coco
 from hybrik.models import builder
 from hybrik.opt import cfg, logger, opt
 from hybrik.utils.env import init_dist
@@ -29,68 +29,45 @@ def _init_fn(worker_id):
     random.seed(opt.seed + worker_id)
 
 
+def loss_mpjpe(predicted, target):
+    """
+    Mean per-joint position error (i.e. mean Euclidean distance),
+    often referred to as "Protocol #1" in many papers.
+    """
+    assert predicted.shape == target.shape
+    return torch.mean(torch.norm(predicted - target, dim=len(target.shape)-1))
+
 def train(opt, train_loader, m, criterion, optimizer, writer, epoch_num):
     print("train start...")
     loss_logger = DataLogger()
-    acc_uvd_29_logger = DataLogger()
     acc_xyz_17_logger = DataLogger()
     m.train()
-    hm_shape = cfg.MODEL.get('HEATMAP_SIZE')
-    depth_dim = cfg.MODEL.EXTRA.get('DEPTH_DIM')
-    hm_shape = (hm_shape[1], hm_shape[0], depth_dim)
-    root_idx_17 = train_loader.dataset.root_idx_17
 
     if opt.log:
         train_loader = tqdm(train_loader, dynamic_ncols=True)
-    # print("train waiting too long...")
-    for j, (inps, labels, _, bboxes) in enumerate(train_loader):
+    for j, (inps, labels, _) in enumerate(train_loader):
         # if j > 1:
         #     break  # break for early stop
         if isinstance(inps, list):
             inps = [inp.cuda(opt.gpu).requires_grad_() for inp in inps]
         else:
             inps = inps.cuda(opt.gpu).requires_grad_()
-        # print("in the train func here")
-        # pop type which is only str
-        labels.pop("type")
         for k, _ in labels.items():
             labels[k] = labels[k].cuda(opt.gpu)
 
-        trans_inv = labels.pop('trans_inv')
-        trans_inv = trans_inv.cuda(opt.gpu)
-        intrinsic_param = labels.pop('intrinsic_param')
-        intrinsic_param = intrinsic_param.cuda(opt.gpu)
-        root = labels.pop('joint_root')
-        root = root.cuda(opt.gpu)
-        depth_factor = labels.pop('depth_factor')
-        depth_factor = depth_factor.cuda(opt.gpu)
+        output = m(inps)
 
-        output = m(inps, trans_inv=trans_inv, intrinsic_param=intrinsic_param, joint_root=root, depth_factor=depth_factor)
+        pred_xyz_jts_17 = output.pred_xyz_jts_17.reshape(inps.shape[0], 17, 3)
 
-        loss = criterion(output, labels)
+        loss = loss_mpjpe(pred_xyz_jts_17, labels['joint_cam_17'])
 
-        pred_uvd_jts = output.pred_uvd_jts
-        pred_xyz_jts_17 = output.pred_xyz_jts_17
-        label_masks_29 = labels['target_weight_29']
-        label_masks_17 = labels['target_weight_17']
-
-        if pred_uvd_jts.shape[1] == 24 or pred_uvd_jts.shape[1] == 72:
-            pred_uvd_jts = pred_uvd_jts.cpu().reshape(pred_uvd_jts.shape[0], 24, 3)
-            gt_uvd_jts = labels['target_uvd_29'].cpu().reshape(pred_uvd_jts.shape[0], 29, 3)[:, :24, :]
-            gt_uvd_mask = label_masks_29.cpu().reshape(pred_uvd_jts.shape[0], 29, 3)[:, :24, :]
-            acc_uvd_29 = calc_coord_accuracy(pred_uvd_jts, gt_uvd_jts, gt_uvd_mask, hm_shape, num_joints=24)
-        else:
-            acc_uvd_29 = calc_coord_accuracy(pred_uvd_jts.detach().cpu(), labels['target_uvd_29'].cpu(), label_masks_29.cpu(), hm_shape, num_joints=29)
-        acc_xyz_17 = calc_coord_accuracy(pred_xyz_jts_17.detach().cpu(), labels['target_xyz_17'].cpu(), label_masks_17.cpu(), hm_shape, num_joints=17, root_idx=root_idx_17)
-
+        # print("MPJPE (mm): ", loss.item()*1000)
         if isinstance(inps, list):
             batch_size = inps[0].size(0)
         else:
             batch_size = inps.size(0)
 
         loss_logger.update(loss.item(), batch_size)
-        acc_uvd_29_logger.update(acc_uvd_29, batch_size)
-        acc_xyz_17_logger.update(acc_xyz_17, batch_size)
 
         optimizer.zero_grad()
         loss.backward()
@@ -105,10 +82,8 @@ def train(opt, train_loader, m, criterion, optimizer, writer, epoch_num):
         if opt.log:
             # TQDM
             train_loader.set_description(
-                'loss: {loss:.8f} | accuvd29: {accuvd29:.4f} | acc17: {acc17:.4f}'.format(
-                    loss=loss_logger.avg,
-                    accuvd29=acc_uvd_29_logger.avg,
-                    acc17=acc_xyz_17_logger.avg)
+                'loss: {loss:.8f}'.format(
+                    loss=loss_logger.avg)
             )
 
     if opt.log:
@@ -127,73 +102,38 @@ def validate_gt(m, opt, cfg, gt_val_dataset, heatmap_to_coord, batch_size=24, pr
     kpt_pred = {}
     m.eval()
 
-    hm_shape = cfg.MODEL.get('HEATMAP_SIZE')
-    hm_shape = (hm_shape[1], hm_shape[0])
 
     if opt.log:
         gt_val_loader = tqdm(gt_val_loader, dynamic_ncols=True)
 
-    for inps, labels, img_ids, bboxes in gt_val_loader:
+    sample_mpjpe = []
+    for inps, labels, img_ids in gt_val_loader:
         if isinstance(inps, list):
             inps = [inp.cuda(opt.gpu) for inp in inps]
         else:
             inps = inps.cuda(opt.gpu)
 
-        for k, _ in labels.items():
-            try:
-                labels[k] = labels[k].cuda(opt.gpu)
-            except AttributeError:
-                assert k == 'type'
-
         # print(inps.shape)
-        output = m(inps, flip_test=opt.flip_test, bboxes=bboxes,
-                   img_center=labels['img_center'])
+        output = m(inps, flip_test=opt.flip_test)
 
-        # pred_xyz_jts_29 = output.pred_xyz_jts_29.reshape(inps.shape[0], -1, 3)
-        pred_xyz_jts_24 = output.pred_xyz_jts_29.reshape(inps.shape[0], -1, 3)[:, :24, :]
-        pred_xyz_jts_24_struct = output.pred_xyz_jts_24_struct.reshape(inps.shape[0], 24, 3)
         pred_xyz_jts_17 = output.pred_xyz_jts_17.reshape(inps.shape[0], 17, 3)
-
-        pred_xyz_jts_24 = pred_xyz_jts_24.cpu().data.numpy()
-        pred_xyz_jts_24_struct = pred_xyz_jts_24_struct.cpu().data.numpy()
         pred_xyz_jts_17 = pred_xyz_jts_17.cpu().data.numpy()
-
-        assert pred_xyz_jts_17.ndim in [2, 3]
-        pred_xyz_jts_17 = pred_xyz_jts_17.reshape(
-            pred_xyz_jts_17.shape[0], 17, 3)
-        # pred_uvd_jts = pred_uvd_jts.reshape(
-        #     pred_uvd_jts.shape[0], -1, 3)
-        pred_xyz_jts_24 = pred_xyz_jts_24.reshape(
-            pred_xyz_jts_24.shape[0], 24, 3)
-        # pred_scores = output.maxvals.cpu().data[:, :29]
-
-        for i in range(pred_xyz_jts_17.shape[0]):
-            # bbox = bboxes[i].tolist()
-            kpt_pred[int(img_ids[i])] = {
-                'xyz_17': pred_xyz_jts_17[i],
-                'xyz_24': pred_xyz_jts_24[i]
-            }
-
-    with open(os.path.join(opt.work_dir, f'test_gt_kpt_rank_{opt.rank}.pkl'), 'wb') as fid:
-        pk.dump(kpt_pred, fid, pk.HIGHEST_PROTOCOL)
+        sample_mpjpe.append(mpjpe(pred_xyz_jts_17, labels['joint_cam_17'].cpu().data.numpy()))
 
     torch.distributed.barrier()  # Make sure all JSON files are saved
 
     if opt.rank == 0:
-        kpt_all_pred = {}
-        for r in range(opt.world_size):
-            with open(os.path.join(opt.work_dir, f'test_gt_kpt_rank_{r}.pkl'), 'rb') as fid:
-                kpt_pred = pk.load(fid)
+        mpjpe_m = np.mean(sample_mpjpe)*1000
+        return mpjpe_m
 
-            os.remove(os.path.join(opt.work_dir, f'test_gt_kpt_rank_{r}.pkl'))
 
-            kpt_all_pred.update(kpt_pred)
-
-        tot_err_17 = gt_val_dataset.evaluate_xyz_17(
-            kpt_all_pred, os.path.join(opt.work_dir, 'test_3d_kpt.json'))
-
-        return tot_err_17
-
+def mpjpe(predicted, target):
+    """
+    Mean per-joint position error (i.e. mean Euclidean distance),
+    often referred to as "Protocol #1" in many papers.
+    """
+    assert predicted.shape == target.shape
+    return np.mean(np.linalg.norm(predicted - target, axis=len(target.shape)-1), axis=1)
 
 def setup_seed(seed):
     random.seed(seed)
@@ -250,8 +190,7 @@ def main_worker(gpu, opt, cfg):
         logger.info(macs, params)
 
     m.cuda(opt.gpu)
-    m = torch.nn.parallel.DistributedDataParallel(m, device_ids=[opt.gpu])
-
+    m = torch.nn.parallel.DistributedDataParallel(m, device_ids=[opt.gpu], find_unused_parameters=True)
     criterion = builder.build_loss(cfg.LOSS).cuda(opt.gpu)
     optimizer = torch.optim.Adam(m.parameters(), lr=cfg.TRAIN.LR)
 
@@ -281,6 +220,11 @@ def main_worker(gpu, opt, cfg):
             cfg=cfg,
             ann_file="3DPW_train_new.json",
             train=True)
+    elif cfg.DATASET.DATASET == "binocular_coco":
+        train_dataset = Binocuular_coco(
+            cfg=cfg,
+            ann_file="pingpong_front_left_image_3d_joint_train.json",
+            train=True)
     else:
         raise NotImplementedError
 
@@ -304,6 +248,11 @@ def main_worker(gpu, opt, cfg):
         gt_val_dataset_3dpw = PW3D(
             cfg=cfg,
             ann_file='3DPW_test_new.json',
+            train=False)
+    elif cfg.DATASET.DATASET == "binocular_coco":
+        gt_val_dataset_binocular_coco = Binocuular_coco(
+            cfg=cfg,
+            ann_file="pingpong_front_left_image_3d_joint_test.json",
             train=False)
     else:
         raise NotImplementedError
@@ -334,7 +283,7 @@ def main_worker(gpu, opt, cfg):
             # Prediction Test
             with torch.no_grad():
                 # gt_tot_err_h36m = validate_gt(m, opt, cfg, gt_val_dataset_h36m, heatmap_to_coord)
-                gt_tot_err_3dpw = validate_gt(m, opt, cfg, gt_val_dataset_3dpw, heatmap_to_coord)
+                gt_tot_err_3dpw = validate_gt(m, opt, cfg, gt_val_dataset_binocular_coco, heatmap_to_coord)
                 if opt.log:
                     # if gt_tot_err_h36m <= best_err_h36m:
                     #     best_err_h36m = gt_tot_err_h36m

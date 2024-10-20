@@ -8,14 +8,52 @@ import numpy as np
 import torch.utils.data as data
 from pycocotools.coco import COCO
 import torch
-
+from PIL import Image
 from hybrik.utils.bbox import bbox_clip_xyxy, bbox_xywh_to_xyxy
 from hybrik.utils.pose_utils import pixel2cam, reconstruction_error
 from hybrik.utils.presets import (SimpleTransform3DSMPL,
                                   SimpleTransform3DSMPLCam)
 
 
-class PW3D(data.Dataset):
+def to_torch(ndarray):
+    # numpy.ndarray => torch.Tensor
+    if type(ndarray).__module__ == 'numpy':
+        return torch.from_numpy(ndarray)
+    elif not torch.is_tensor(ndarray):
+        raise ValueError("Cannot convert {} to torch tensor"
+                         .format(type(ndarray)))
+    return ndarray
+def im_to_torch(img):
+    """Transform ndarray image to torch tensor.
+
+    Parameters
+    ----------
+    img: numpy.ndarray
+        An ndarray with shape: `(H, W, 3)`.
+
+    Returns
+    -------
+    torch.Tensor
+        A tensor with shape: `(3, H, W)`.
+
+    """
+    # print(img.shape)
+    # img = np.transpose(img, (2, 0, 1))  # C*H*W
+    img = to_torch(img).float()
+    if img.max() > 1:
+        img /= 255
+    return img
+
+from torchvision import transforms
+
+# 定义 transform 流程：调整大小 -> 转为 Tensor -> 归一化
+my_transform = transforms.Compose([
+    transforms.Resize((256, 256)),  # 调整图片大小为 256x256
+    transforms.ToTensor(),          # 将图片转换为 PyTorch Tensor 并将像素值归一化到 [0, 1]
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # 归一化到 [-1, 1]
+])
+
+class Binocuular_coco(data.Dataset):
     """ 3DPW dataset.
 
     Parameters
@@ -74,14 +112,14 @@ class PW3D(data.Dataset):
     def __init__(self,
                  cfg,
                  ann_file,
-                 root='/mnt/weijiangning-pose-estimation-data/3DPW',
+                 root='/mnt/weijiangning-pose-estimation-data/dual_camera_data',
                  train=True,
                  skip_empty=True,
                  dpg=False,
                  lazy_import=False):
         self._cfg = cfg
 
-        self._ann_file = os.path.join(root, 'json', ann_file)
+        self._ann_file = os.path.join(root, 'pingpong_json', ann_file)
         self._lazy_import = lazy_import
         self._root = root
         self._skip_empty = skip_empty
@@ -123,9 +161,6 @@ class PW3D(data.Dataset):
         self.root_idx_17 = self.joints_name_17.index('Pelvis')
         self.lshoulder_idx_17 = self.joints_name_17.index('L_Shoulder')
         self.rshoulder_idx_17 = self.joints_name_17.index('R_Shoulder')
-        self.root_idx_smpl = self.joints_name_24.index('pelvis')
-        self.lshoulder_idx_24 = self.joints_name_24.index('left_shoulder')
-        self.rshoulder_idx_24 = self.joints_name_24.index('right_shoulder')
 
         self.db = self.load_pt()
 
@@ -160,16 +195,18 @@ class PW3D(data.Dataset):
         img_id = self.db['img_id'][idx]
         # load ground truth, including bbox, keypoints, image size
         label = {}
-        for k in self.db.keys():
-            label[k] = self.db[k][idx].copy()
-        img = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
-
+        label['joint_img_17'] = self.db['joint_img_17'][idx].copy()
+        label['joint_vis_17'] = self.db['joint_vis_17'][idx].copy()
+        label['joint_cam_17'] = self.db['joint_cam_17'][idx].copy()
+        label['joint_ralative_17'] = self.db['joint_relative_17'][idx].copy()
+        img = Image.open(img_path)
         # transform ground truth into training label and apply data augmentation
-        target = self.transformation(img, label)
-
-        img = target.pop('image')
-        bbox = target.pop('bbox')
-        return img, target, img_id, bbox
+        # target = self.transformation(img, label)
+        img = my_transform(img)
+        img = im_to_torch(img)
+        # img = target.pop('image')
+        # bbox = target.pop('bbox')
+        return img, label, img_id
 
     def __len__(self):
         return len(self.db['img_path'])
@@ -222,50 +259,16 @@ class PW3D(data.Dataset):
             sequence_name = img['sequence']
             img_name = img['file_name']
             abs_path = os.path.join(
-                self._root, 'imageFiles', sequence_name, img_name)
+                self._root, 'left_video_frames/pingpong/front', sequence_name, img_name)
 
-            beta = np.array(ann['smpl_param']['shape']).reshape(10)
-            theta = np.array(ann['smpl_param']['pose']).reshape(24, 3)
-
-            x, y, w, h = ann['bbox']
-            xmin, ymin, xmax, ymax = bbox_clip_xyxy(bbox_xywh_to_xyxy(ann['bbox']), width, height)
-            if xmin > xmax - 5 or ymin > ymax - 5:
-                continue
-
-            f = np.array(img['cam_param']['focal'], dtype=np.float32)
-            c = np.array(img['cam_param']['princpt'], dtype=np.float32)
-
-            joint_cam_17 = np.array(ann['h36m_joints'], dtype=np.float32).reshape(17, 3)
+            joint_cam_17 = np.array(ann['3d_joints'], dtype=np.float32).reshape(17, 3)
             joint_vis_17 = np.ones((17, 3))
             joint_img_17 = np.zeros((17, 3))
 
             joint_relative_17 = joint_cam_17 - joint_cam_17[self.root_idx_17, :]
 
-            joint_cam = np.array(ann['smpl_joint_cam'])
-            if joint_cam.size == 24 * 3:
-                joint_cam_29 = np.zeros((29, 3))
-                joint_cam_29[:24, :] = joint_cam.reshape(24, 3)
-            else:
-                joint_cam_29 = joint_cam.reshape(29, 3)
-
-            joint_img = np.array(ann['smpl_joint_img'], dtype=np.float32).reshape(24, 3)
-            if joint_img.size == 24 * 3:
-                joint_img_29 = np.zeros((29, 3))
-                joint_img_29[:24, :] = joint_img.reshape(24, 3)
-            else:
-                joint_img_29 = joint_img.reshape(29, 3)
-
-            joint_img_29[:, 2] = joint_img_29[:, 2] - joint_img_29[self.root_idx_smpl, 2]
-
-            joint_vis_24 = np.ones((24, 3))
-            joint_vis_29 = np.zeros((29, 3))
-            joint_vis_29[:24, :] = joint_vis_24
-
-            root_cam = joint_cam_29[self.root_idx_smpl]
-
             items.append(abs_path)
             labels.append({
-                'bbox': (xmin, ymin, xmax, ymax),
                 'img_id': cnt,
                 'img_path': abs_path,
                 'img_name': img_name,
@@ -275,14 +278,6 @@ class PW3D(data.Dataset):
                 'joint_vis_17': joint_vis_17,
                 'joint_cam_17': joint_cam_17,
                 'joint_relative_17': joint_relative_17,
-                'joint_img_29': joint_img_29,
-                'joint_vis_29': joint_vis_29,
-                'joint_cam_29': joint_cam_29,
-                'beta': beta,
-                'theta': theta,
-                'root_cam': root_cam,
-                'f': f,
-                'c': c
             })
             cnt += 1
 

@@ -183,11 +183,9 @@ class Simple3DPoseBaseSMPLCam(nn.Module):
 
     def forward(self, x, flip_test=False, **kwargs):
         batch_size = x.shape[0]
-
         x0 = self.preact(x)
         out = self.deconv_layers(x0)
         out = self.final_layer(out)
-
         if flip_test:
             flip_x = flip(x)
             flip_x0 = self.preact(flip_x)
@@ -257,6 +255,7 @@ class Simple3DPoseBaseSMPLCam(nn.Module):
         pred_phi = pred_phi.reshape(batch_size, 23, 2)
 
         if flip_test:
+
             flip_x0 = self.avg_pool(flip_x0)
             flip_x0 = flip_x0.view(flip_x0.size(0), -1)
 
@@ -265,11 +264,15 @@ class Simple3DPoseBaseSMPLCam(nn.Module):
             flip_xc = self.fc2(flip_xc)
             flip_xc = self.drop2(flip_xc)
 
+            # print("flip_xc shape: ", flip_xc.shape)
+            # print("flip_x0 shape: ", flip_x0.shape)
             flip_delta_shape = self.decshape(flip_xc)
             flip_pred_shape = flip_delta_shape + init_shape
             flip_pred_phi = self.decphi(flip_xc)
             flip_pred_camera = self.deccam(flip_xc).reshape(batch_size, -1) + init_cam
-            flip_sigma = self.decsigma(flip_x0).reshape(
+            # flip_sigma = self.decsigma(flip_x0).reshape(
+            #     batch_size, 29, 1).sigmoid()
+            flip_sigma = self.decsigma(flip_xc).reshape(
                 batch_size, 29, 1).sigmoid()
 
             pred_shape = (pred_shape + flip_pred_shape) / 2
@@ -281,7 +284,7 @@ class Simple3DPoseBaseSMPLCam(nn.Module):
             flip_pred_camera[:, 1] = -flip_pred_camera[:, 1]
             pred_camera = (pred_camera + flip_pred_camera) / 2
 
-            flip_sigma = self.flip_sigma(flip_sigma)
+            # flip_sigma = self.flip_sigma(flip_sigma)
             sigma = (sigma + flip_sigma) / 2
 
         camScale = pred_camera[:, :1].unsqueeze(1)
@@ -347,23 +350,23 @@ class Simple3DPoseBaseSMPLCam(nn.Module):
         transl = camera_root - output.joints.float().reshape(-1, 24, 3)[:, 0, :]
 
         output = edict(
-            pred_phi=pred_phi,
-            pred_delta_shape=delta_shape,
-            pred_shape=pred_shape,
-            pred_theta_mats=pred_theta_mats,
-            pred_uvd_jts=pred_uvd_jts_29.reshape(batch_size, -1),
-            pred_xyz_jts_29=pred_xyz_jts_29_flat,
-            pred_xyz_jts_24=pred_xyz_jts_24,
-            pred_xyz_jts_24_struct=pred_xyz_jts_24_struct,
+            # pred_phi=pred_phi,
+            # pred_delta_shape=delta_shape,
+            # pred_shape=pred_shape,
+            # pred_theta_mats=pred_theta_mats,
+            # pred_uvd_jts=pred_uvd_jts_29.reshape(batch_size, -1),
+            # pred_xyz_jts_29=pred_xyz_jts_29_flat,
+            # pred_xyz_jts_24=pred_xyz_jts_24,
+            # pred_xyz_jts_24_struct=pred_xyz_jts_24_struct,
             pred_xyz_jts_17=pred_xyz_jts_17_flat,
-            pred_vertices=pred_vertices,
-            maxvals=maxvals,
-            cam_scale=camScale[:, 0],
-            cam_trans=camTrans[:, 0],
-            cam_root=camera_root,
-            transl=transl,
-            pred_sigma=sigma,
-            scores=1 - sigma,
+            # pred_vertices=pred_vertices,
+            # maxvals=maxvals,
+            # cam_scale=camScale[:, 0],
+            # cam_trans=camTrans[:, 0],
+            # cam_root=camera_root,
+            # transl=transl,
+            # pred_sigma=sigma,
+            # scores=1 - sigma,
             # uvd_heatmap=torch.stack([hm_x0, hm_y0, hm_z0], dim=2),
             # uvd_heatmap=heatmaps,
             # img_feat=x0
